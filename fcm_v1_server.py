@@ -1,6 +1,5 @@
 import json
 import os
-import tempfile
 from typing import Any, Dict, Optional
 
 import requests
@@ -12,19 +11,20 @@ from google.auth.transport.requests import Request
 
 PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "respect-app-dbc77")
 
-# محليًا على Windows استخدم FIREBASE_SERVICE_ACCOUNT أو المسار الافتراضي.
-# على Render استخدم FIREBASE_SERVICE_ACCOUNT_JSON وضع محتوى ملف respect-app.json كاملًا.
-SERVICE_ACCOUNT_FILE = os.getenv("FIREBASE_SERVICE_ACCOUNT", r"C:\keys\respect-app.json")
+# Render/VPS:
+# ضع محتوى ملف Firebase service account كامل داخل FIREBASE_SERVICE_ACCOUNT_JSON
 SERVICE_ACCOUNT_JSON = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
+
+# Local Windows:
+# أو استخدم FIREBASE_SERVICE_ACCOUNT / C:\keys\respect-app.json
+SERVICE_ACCOUNT_FILE = os.getenv("FIREBASE_SERVICE_ACCOUNT", r"C:\keys\respect-app.json")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://oafbzceorbjykgoffuaa.supabase.co").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "sb_publishable_UXfOau7Th8Nu3Vs85a-7-g_Xn8Tjt0S")
 APP_SHARED_SECRET = os.getenv("APP_SHARED_SECRET", "")
-
 SCOPES = ["https://www.googleapis.com/auth/firebase.messaging"]
 
 app = FastAPI(title="Respect App FCM HTTP v1 Server")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -40,25 +40,14 @@ def _check_secret(x_app_secret: Optional[str]) -> None:
 
 
 def _load_service_account_info() -> Dict[str, Any]:
-    """
-    يدعم طريقتين:
-    1) Render/VPS: FIREBASE_SERVICE_ACCOUNT_JSON = محتوى ملف JSON كامل.
-    2) Windows local: FIREBASE_SERVICE_ACCOUNT أو C:\\keys\\respect-app.json.
-    """
     if SERVICE_ACCOUNT_JSON:
         try:
             return json.loads(SERVICE_ACCOUNT_JSON)
         except json.JSONDecodeError as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Invalid FIREBASE_SERVICE_ACCOUNT_JSON: {e}",
-            )
+            raise HTTPException(status_code=500, detail=f"Invalid FIREBASE_SERVICE_ACCOUNT_JSON: {e}")
 
     if not os.path.exists(SERVICE_ACCOUNT_FILE):
-        raise HTTPException(
-            status_code=500,
-            detail=f"Service account file not found: {SERVICE_ACCOUNT_FILE}",
-        )
+        raise HTTPException(status_code=500, detail=f"Service account file not found: {SERVICE_ACCOUNT_FILE}")
 
     try:
         with open(SERVICE_ACCOUNT_FILE, "r", encoding="utf-8") as f:
@@ -68,9 +57,11 @@ def _load_service_account_info() -> Dict[str, Any]:
 
 
 def get_access_token() -> str:
-    info = _load_service_account_info()
     try:
-        creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+        creds = service_account.Credentials.from_service_account_info(
+            _load_service_account_info(),
+            scopes=SCOPES,
+        )
         creds.refresh(Request())
         return creds.token
     except Exception as e:
@@ -146,6 +137,12 @@ class CallPushRequest(BaseModel):
     video: bool = False
 
 
+def _string_data(data: Dict[str, Any], msg_type: str, title: str, body: str) -> Dict[str, str]:
+    # FCM data must be string:string only.
+    merged = {**data, "type": msg_type, "title": title, "body": body}
+    return {str(k): "" if v is None else str(v) for k, v in merged.items()}
+
+
 def send_fcm_v1(token: str, msg_type: str, title: str, body: str, data: Dict[str, Any]) -> Dict[str, Any]:
     token = token.strip()
     if not token:
@@ -154,30 +151,40 @@ def send_fcm_v1(token: str, msg_type: str, title: str, body: str, data: Dict[str
     access_token = get_access_token()
     url = f"https://fcm.googleapis.com/v1/projects/{PROJECT_ID}/messages:send"
 
-    clean_data = {
-        str(k): "" if v is None else str(v)
-        for k, v in {**data, "type": msg_type, "title": title, "body": body}.items()
-    }
+    clean_data = _string_data(data, msg_type, title, body)
 
-    channel_id = "respect_calls_channel" if msg_type == "call" else "respect_messages_channel"
-
-    payload = {
-        "message": {
-            "token": token,
-            "notification": {
-                "title": title,
-                "body": body,
-            },
-            "data": clean_data,
-            "android": {
-                "priority": "HIGH",
-                "notification": {
-                    "channel_id": channel_id,
-                    "sound": "default",
+    if msg_type == "call":
+        # مهم جدًا:
+        # المكالمات Data Only Push حتى تصل إلى IncomingCallFirebaseMessagingService
+        # ولا يعرضها Firebase كإشعار عادي فقط.
+        payload = {
+            "message": {
+                "token": token,
+                "data": clean_data,
+                "android": {
+                    "priority": "HIGH",
+                    "ttl": "45s",
                 },
-            },
+            }
         }
-    }
+    else:
+        payload = {
+            "message": {
+                "token": token,
+                "notification": {
+                    "title": title,
+                    "body": body,
+                },
+                "data": clean_data,
+                "android": {
+                    "priority": "HIGH",
+                    "notification": {
+                        "channel_id": "respect_messages_channel",
+                        "sound": "default",
+                    },
+                },
+            }
+        }
 
     response = requests.post(
         url,
@@ -190,6 +197,7 @@ def send_fcm_v1(token: str, msg_type: str, title: str, body: str, data: Dict[str
     )
 
     print("========== FCM RESPONSE ==========")
+    print("TYPE:", msg_type)
     print("STATUS:", response.status_code)
     print("BODY:", response.text)
     print("==================================")
@@ -204,16 +212,15 @@ def send_fcm_v1(token: str, msg_type: str, title: str, body: str, data: Dict[str
             },
         )
 
-    return {"ok": True, "firebase": response.json()}
+    return {"ok": True, "firebase": response.json(), "sent_as": "data_only_call" if msg_type == "call" else "notification_message"}
 
 
 @app.get("/")
 def health():
-    service_account_source = "env:FIREBASE_SERVICE_ACCOUNT_JSON" if SERVICE_ACCOUNT_JSON else SERVICE_ACCOUNT_FILE
     return {
         "ok": True,
         "project": PROJECT_ID,
-        "service_account_source": service_account_source,
+        "service_account_source": "env:FIREBASE_SERVICE_ACCOUNT_JSON" if SERVICE_ACCOUNT_JSON else SERVICE_ACCOUNT_FILE,
         "using_service_account_json_env": bool(SERVICE_ACCOUNT_JSON),
         "service_account_file_exists": os.path.exists(SERVICE_ACCOUNT_FILE),
     }
@@ -277,9 +284,13 @@ def send_call_push(req: CallPushRequest, x_app_secret: Optional[str] = Header(de
         body,
         {
             "callId": req.callId,
+            "call_id": req.callId,
             "callerUsername": display_username(req.callerUsername),
+            "caller_username": display_username(req.callerUsername),
             "callerName": req.callerName,
+            "caller_name": req.callerName,
             "callerAvatarPath": req.callerAvatar,
+            "caller_avatar": req.callerAvatar,
             "video": str(req.video).lower(),
             "call_type": "video" if req.video else "audio",
         },
