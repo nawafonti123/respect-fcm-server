@@ -1,4 +1,6 @@
+import json
 import os
+import tempfile
 from typing import Any, Dict, Optional
 
 import requests
@@ -9,16 +11,20 @@ from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 
 PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "respect-app-dbc77")
-SERVICE_ACCOUNT_FILE = os.getenv(
-    "FIREBASE_SERVICE_ACCOUNT",
-    r"C:\keys\respect-app.json",
-)
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://oafbzceorbjykgoffuaa.supabase.co")
+
+# محليًا على Windows استخدم FIREBASE_SERVICE_ACCOUNT أو المسار الافتراضي.
+# على Render استخدم FIREBASE_SERVICE_ACCOUNT_JSON وضع محتوى ملف respect-app.json كاملًا.
+SERVICE_ACCOUNT_FILE = os.getenv("FIREBASE_SERVICE_ACCOUNT", r"C:\keys\respect-app.json")
+SERVICE_ACCOUNT_JSON = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://oafbzceorbjykgoffuaa.supabase.co").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "sb_publishable_UXfOau7Th8Nu3Vs85a-7-g_Xn8Tjt0S")
 APP_SHARED_SECRET = os.getenv("APP_SHARED_SECRET", "")
+
 SCOPES = ["https://www.googleapis.com/auth/firebase.messaging"]
 
-app = FastAPI(title="Respect App FCM HTTP v1 Server - Fixed")
+app = FastAPI(title="Respect App FCM HTTP v1 Server")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -33,18 +39,42 @@ def _check_secret(x_app_secret: Optional[str]) -> None:
         raise HTTPException(status_code=401, detail="Invalid X-App-Secret")
 
 
-def get_access_token() -> str:
+def _load_service_account_info() -> Dict[str, Any]:
+    """
+    يدعم طريقتين:
+    1) Render/VPS: FIREBASE_SERVICE_ACCOUNT_JSON = محتوى ملف JSON كامل.
+    2) Windows local: FIREBASE_SERVICE_ACCOUNT أو C:\\keys\\respect-app.json.
+    """
+    if SERVICE_ACCOUNT_JSON:
+        try:
+            return json.loads(SERVICE_ACCOUNT_JSON)
+        except json.JSONDecodeError as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Invalid FIREBASE_SERVICE_ACCOUNT_JSON: {e}",
+            )
+
     if not os.path.exists(SERVICE_ACCOUNT_FILE):
         raise HTTPException(
             status_code=500,
             detail=f"Service account file not found: {SERVICE_ACCOUNT_FILE}",
         )
-    creds = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE,
-        scopes=SCOPES,
-    )
-    creds.refresh(Request())
-    return creds.token
+
+    try:
+        with open(SERVICE_ACCOUNT_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Cannot read service account file: {e}")
+
+
+def get_access_token() -> str:
+    info = _load_service_account_info()
+    try:
+        creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+        creds.refresh(Request())
+        return creds.token
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create Firebase access token: {e}")
 
 
 def normalize_username(value: str) -> str:
@@ -59,6 +89,7 @@ def display_username(value: str) -> str:
 def get_user_fcm_token(receiver_username: str) -> Optional[str]:
     clean = normalize_username(receiver_username)
     display = display_username(clean)
+
     url = f"{SUPABASE_URL}/rest/v1/users"
     headers = {
         "apikey": SUPABASE_KEY,
@@ -69,12 +100,15 @@ def get_user_fcm_token(receiver_username: str) -> Optional[str]:
         "or": f"(username.eq.{clean},username.eq.{display})",
         "limit": "1",
     }
+
     response = requests.get(url, headers=headers, params=params, timeout=15)
     if response.status_code >= 400:
         raise HTTPException(status_code=500, detail=f"Supabase error: {response.text}")
+
     rows = response.json()
     if not rows:
         return None
+
     token = rows[0].get("fcm_token")
     return str(token).strip() if token else None
 
@@ -120,7 +154,6 @@ def send_fcm_v1(token: str, msg_type: str, title: str, body: str, data: Dict[str
     access_token = get_access_token()
     url = f"https://fcm.googleapis.com/v1/projects/{PROJECT_ID}/messages:send"
 
-    # FCM data must be string:string only.
     clean_data = {
         str(k): "" if v is None else str(v)
         for k, v in {**data, "type": msg_type, "title": title, "body": body}.items()
@@ -128,7 +161,6 @@ def send_fcm_v1(token: str, msg_type: str, title: str, body: str, data: Dict[str
 
     channel_id = "respect_calls_channel" if msg_type == "call" else "respect_messages_channel"
 
-    # Payload مبسط لتجنب أخطاء AndroidNotification الزائدة.
     payload = {
         "message": {
             "token": token,
@@ -163,25 +195,27 @@ def send_fcm_v1(token: str, msg_type: str, title: str, body: str, data: Dict[str
     print("==================================")
 
     if response.status_code >= 400:
-        # يرجع الخطأ كامل في Swagger بدل Bad Request فقط.
         raise HTTPException(
             status_code=400,
             detail={
                 "firebase_status": response.status_code,
                 "firebase_body": response.text,
-                "hint": "إذا ظهر SENDER_ID_MISMATCH فتأكد أن google-services.json و service account لنفس مشروع Firebase. إذا ظهر UNREGISTERED فالتوكن قديم؛ احذف التطبيق وثبته من جديد.",
+                "hint": "SENDER_ID_MISMATCH يعني google-services.json أو service account من مشروع مختلف. UNREGISTERED يعني التوكن قديم.",
             },
         )
+
     return {"ok": True, "firebase": response.json()}
 
 
 @app.get("/")
 def health():
+    service_account_source = "env:FIREBASE_SERVICE_ACCOUNT_JSON" if SERVICE_ACCOUNT_JSON else SERVICE_ACCOUNT_FILE
     return {
         "ok": True,
         "project": PROJECT_ID,
-        "service_account_file": SERVICE_ACCOUNT_FILE,
-        "service_account_exists": os.path.exists(SERVICE_ACCOUNT_FILE),
+        "service_account_source": service_account_source,
+        "using_service_account_json_env": bool(SERVICE_ACCOUNT_JSON),
+        "service_account_file_exists": os.path.exists(SERVICE_ACCOUNT_FILE),
     }
 
 
@@ -205,9 +239,11 @@ def send_message_push(req: MessagePushRequest, x_app_secret: Optional[str] = Hea
     _check_secret(x_app_secret)
     title = req.senderName.strip() or display_username(req.senderUsername)
     body = req.text.strip() or "أرسل لك رسالة"
+
     token = get_user_fcm_token(req.receiverUsername)
     if not token:
         raise HTTPException(status_code=400, detail="receiver_has_no_fcm_token")
+
     return send_fcm_v1(
         token,
         "message",
@@ -218,6 +254,8 @@ def send_message_push(req: MessagePushRequest, x_app_secret: Optional[str] = Hea
             "senderUsername": display_username(req.senderUsername),
             "senderName": req.senderName,
             "text": req.text,
+            "peerUsername": display_username(req.senderUsername),
+            "peerName": title,
         },
     )
 
@@ -227,9 +265,11 @@ def send_call_push(req: CallPushRequest, x_app_secret: Optional[str] = Header(de
     _check_secret(x_app_secret)
     title = "مكالمة فيديو واردة" if req.video else "مكالمة صوتية واردة"
     body = req.callerName.strip() or display_username(req.callerUsername)
+
     token = get_user_fcm_token(req.receiverUsername)
     if not token:
         raise HTTPException(status_code=400, detail="receiver_has_no_fcm_token")
+
     return send_fcm_v1(
         token,
         "call",
